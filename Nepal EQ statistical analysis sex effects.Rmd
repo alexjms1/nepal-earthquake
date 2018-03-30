@@ -1,0 +1,830 @@
+---
+title: "Nepal Earthquake Intervention Analysis"
+author: "Alex James"
+date: "July 28, 2017"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+header-includes:
+- \usepackage{booktabs}
+- \usepackage{rotating}
+- \usepackage{longtable}
+- \usepackage{dcolumn}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Nepal Earthquake Intervention Study
+
+## Getting the data in
+x results of disaster-preparedness and mental health intervention study conducted following an earthquake event in Nepal.  First we load the required R packages, load the STATA file and inspect its structure.  Major heavy-lifting of data cleaning, feature generation, and converstion to long-format was conducted using SPSS and STATA (see asssociated .sps SPSS syntax files and .do STATA scripts).  For example, corrections to ordinal variables which were incorrectly binarized and generation of mental health / behavioral scale scores from means or sums of indivdiual items were done using these software.  
+
+```{r}
+melt_data_suffix <- function(var_name) {
+  new_var <- vector(mode = "numeric", length = nrow(data))
+  new_var[data$timePoint == '1'] <- as.numeric(data[[paste0(var_name, '1')]][data$timePoint == '1'])
+  new_var[data$timePoint == '2'] <- as.numeric(data[[paste0(var_name, '2')]][data$timePoint == '2'])
+  new_var[data$timePoint == '3'] <- as.numeric(data[[paste0(var_name, '3')]][data$timePoint == '3'])
+  return(new_var)
+}
+
+melt_data_prefix <- function(var_name) {
+  var_name <- substr(var_name, 3, nchar(var_name))
+  new_var <- vector(mode = "numeric", length = nrow(data))
+  new_var <- as.numeric(data[[paste0('T1', var_name)]])
+  new_var[data$timePoint == '1'] <- as.numeric(data[[paste0('T1',var_name)]][data$timePoint == '1'])
+  new_var[data$timePoint == '2'] <- as.numeric(data[[paste0('T2',var_name)]][data$timePoint == '2'])
+  new_var[data$timePoint == '3'] <- as.numeric(data[[paste0('T3',var_name)]][data$timePoint == '3'])
+  return(new_var)
+}
+```
+
+```{r message = FALSE, warnings = FALSE}
+library(haven)
+library(ggplot2)
+library(dplyr)
+library(scales)
+library(lme4)
+library(lsmeans)
+library(car)
+library(RLRsim)
+library(texreg)
+library(magrittr)
+library(xtable)
+library(lmerTest)
+library(ordinal)
+library(RVAideMemoire)
+library(reporttools)
+#source("https://raw.github.com/glmmTMB/glmmTMB/master/misc/lsmeans.R")
+setwd("C:/Users/ajame/Dropbox/Alex - Nepal/EQ data")
+data <- read_dta("Kathmandu_Valley_NEPAL_all_times WITH LABELS reshaped.dta")
+```
+
+We filter out subjects that did not participate in the intervention at any time point (this is a stepped-wedge design) by selecting only subjects that have positive values in the associated indicator variables, and then convert data to factor variables where applicable.   We also create a variable, interventionPlotting, that corrects the intervention effect variable (interventionT) to make it more useful for our plotting.  We'll also reshape/melt some of the variables manually to long format (across time points).
+
+```{r}
+data %<>% as_factor(data)
+data %<>% rename(city = T1Citycode, gender = T1Gender)
+data$timePoint <- factor(data$timePoint)
+data$interventPlotting <- data$interventionT
+data$interventPlotting[data$city=='Chhaling' & data$timePoint=='1'] <- 'Intervention'
+data$interventPlotting[data$city=='Tathali' & data$timePoint=='2'] <- 'Intervention'
+data$phqMean6_T <- data$phqMean6_T + 1
+
+to_melt_prefix <- c('T1DisMH1Anxiousdep', 'T1DisMH2Avoid')
+
+for(i in to_melt_prefix){
+  data[[paste0(substr(i,3,nchar(i)), '_T')]] <- melt_data_prefix(i) 
+}
+
+filtered <- data %>% filter(T2Interventionparticipant == 1 | T3Interventionparticipant == 1)
+
+```
+
+First let's get descriptive statistics on disaster preparedness items.
+
+```{r}
+T1_DP_vars <- filtered %>% filter(timePoint == "1") %>% select(T1Disprep1futureEQrevCoded, T1Disprep2monsoonprepfixedrev, T1Disprep3Supplykit, T1Disprep3Foodwater, T1Disprep3Docs, T1Disprep3Dwelling, T1Disprep3Furn, T1Disprep3Famplan, T1Disprep3Commplan)
+
+T2_DP_vars <- filtered %>% filter(timePoint == "2") %>% select(T2Disprep1futureEQrevCoded, T2Disprep2monsoonprepfixedrev, T2Disprep3Supplykit, T2Disprep3Foodwater, T2Disprep3Docs, T2Disprep3Dwelling, T2Disprep3Furn, T2Disprep3Famplan, T2Disprep3Commplan)
+
+T3_DP_vars <- filtered %>% filter(timePoint == "3") %>% select(T3Disprep1futureEQrevCoded, T3Disprep2monsoonprepfixedrev, T3Disprep3Supplykit, T3Disprep3Foodwater, T3Disprep3Docs, T3Disprep3Dwelling, T3Disprep3Furn, T3Disprep3Famplan, T3Disprep3Commplan)
+```
+
+```{r, results = "asis"}
+tableNominal(vars = as.data.frame(T1_DP_vars), lab = "tabdp1", longtable = TRUE, cumsum = FALSE, cap = "Descriptive statistics of disaster preparation behaviors time 1 questions")
+
+tableNominal(vars = as.data.frame(T2_DP_vars), lab = "tabdp2", longtable = TRUE, cumsum = FALSE, cap = "Descriptive statistics of disaster preparation behaviors time 2 questions")
+
+tableNominal(vars = as.data.frame(T3_DP_vars), lab = "tabdp3", longtable = TRUE, cumsum = FALSE, cap = "Descriptive statistics of disaster preparation behaviors time 3 questions")
+```
+
+Now let's perform a Cronbach's alpha analysis on disaster preparedness items - we can use the alphas if item is omitted to detect outliers.
+
+```{r alphas}
+psych::alpha(x = select(T1_DP_vars, -T1Disprep1futureEQrevCoded, -T1Disprep2monsoonprepfixedrev), cumulative = TRUE)
+
+psych::alpha(x = select(T2_DP_vars, -T2Disprep1futureEQrevCoded, -T2Disprep2monsoonprepfixedrev), cumulative = TRUE)
+
+psych::alpha(x = select(T3_DP_vars, -T3Disprep1futureEQrevCoded, -T3Disprep2monsoonprepfixedrev), cumulative = TRUE)
+```
+
+Having done that, we can ask whether disaster preparedness is correlated with our mental health measures (a primary assumption of the intervention).
+
+```{r}
+cor.test( ~ disPrepBehaviorsT  + phqMean6_T, data = filtered, subset = timePoint == "1" )
+cor.test( ~ disPrepBehaviorsT  + ptsdMean11_T, data = filtered, subset = timePoint == "1" )
+```
+
+Next we take a look at histograms of key dependent measures faceted by time-point to see the shapes of their distributions.  We plan to apply a linear model, so we need to understand to what degree that's appropriate and/or the most appropriate generalized linear model.
+
+```{r}
+dvs = c('disPrepBehaviorsT', 'phqMean6_T', 'ptsdMean11_T', 'HelpSeekingMentalT', 'HelpSeekingDisT', 'socialCohesionT')
+var=dvs[1]
+for(var in dvs) {
+  print(ggplot(data = filtered, aes_string(x=var)) + geom_histogram(bins=14) + facet_grid(.~timePoint))
+}
+
+factor_dvs <- c('HelpSeekingMentalT', 'HelpSeekingDisT')
+filtered %<>% mutate_at(factor_dvs, funs(factor(.)))
+
+``` 
+
+It appears the first depedent measure follows a binomial process, the second two may be approximated by a gamma  process, but they contain zeros; and the remaining may be reasonably approximated by a Gaussian distribution.  The last might also be considered binomial.
+
+## Function for plotting
+Containing data organized by city across time points and marginal means for intervention effect
+
+```{r cache = TRUE}
+plot_line_bar <- function(dv, limits, mmeans, theme_style = theme_grey(), title = "", position=c(.8825, .25), by=.5, logit=FALSE, caption = "", rnge = c(0,0), save = FALSE) {
+  
+  if(logit) {
+    mmeans_summary <- summary(mmeans, type="response")*logit
+  } else {
+    mmeans_summary <- summary(mmeans)  
+  }
+  
+  
+  results <- data.frame(interventPlotting = factor(c(1,2), labels=c('Pre-intervention', 'Post-intervention')), 
+                        SE = mmeans_summary[,'SE'], calc_margins = mmeans_summary[,2])
+  results$plus <- results$calc_margins + results$SE
+  results$minus <- results$calc_margins - results$SE
+
+
+  if(is.factor(filtered[[dv]])) {
+    filtered[[paste0(dv, '_numeric')]] <- as.numeric(filtered[[dv]])
+    dv <- paste0(dv, '_numeric')
+  }
+  
+  breaks <- seq(limits[1], limits[2], by=by)
+  wrap_113 <- wrap_format(113)
+  
+  line <- ggplot(filtered, aes_string(x="timePoint", y=dv, group="city", shape="city")) +
+        geom_hline(yintercept = results$calc_margins[1], color = "#F8766D", alpha = .75, linetype = 3) + 
+        geom_hline(yintercept = results$calc_margins[2], color = "#00BFC4", alpha = .5, linetype = 1) +
+        stat_summary(geom="errorbar", fun.data=mean_se, fun.args=list(mult=1), width=.09, size=1, alpha=.8, aes(color=interventionT)) +
+        stat_summary(data=subset(filtered, interventPlotting == 'Intervention'), aes(color=interventPlotting), geom="line", fun.y="mean", size=1, alpha=.8, linetype=1) +
+        stat_summary(data=subset(filtered, interventionT == 'Control'), aes(color=interventionT), geom="line", fun.y="mean", size=1, alpha=.8, linetype = 3) +
+        stat_summary(geom="point", fun.y="mean", size=4, aes(color=interventionT))  +
+        annotate("rect", xmin = 0, xmax = Inf, ymin=min(results$calc_margins), ymax=max(results$calc_margins), alpha=0.2, fill="grey") +
+        coord_cartesian(ylim=limits) +
+        scale_shape_discrete("") +
+        scale_color_discrete("",labels=c('Pre-intervention', 'Intervention')) + 
+        labs(color="Condition", shape="City", x="Time point", y=title, caption = wrap_113(sprintf(caption, rnge[1], rnge[2]))) +
+        theme_style +
+        theme(
+            legend.position=position, 
+            plot.caption=element_text(hjust=0),
+            legend.box.just="left",
+            legend.background = element_rect(color = "transparent", fill = "transparent"),
+            legend.key = element_rect(color = "transparent", fill = "transparent"),
+            legend.title = element_blank()
+        )   + guides(shape = guide_legend(override.aes = list(shape=c(19,17))),
+              colour = guide_legend(override.aes = list(linetype = c(3,1), shape=NA)))
+  line
+  if(save) {
+    ggsave(paste0(title, '.pdf'), device=cairo_pdf, width = 7.5, height = 5)
+  }
+  print(line)
+}
+```
+## Performing the tests of pre-planned hypotheses of intervention effects using linear mixed models
+
+Subjects' data were collected across three time points, and subjects were clustered within communities (2), resulting in a three-level hierarchical model (measurements clustered within subjects clustered within community) with fixed effects of time point and intervention and random intercepts at the community and subject level.  First we define a model using `glmer` or `lmer` from the `lme4` package; `afex::mixed` gives us ANOVA Type 3 p-values for the fixed effects by Kenward-Roger method.  Alternatively, `glmmTMB` gives us fixed effects p-values directly within the model.  We use the `lsmeans` package to compute marginal means. `car::Anova` will be used to generate type III ANOVA-style contrasts of factor effects. We'll also calculate separate models with `city` as a factor (instead of `interventionT`) in order to generate contrasts for subsequent labeling of significance of our plots.  Exploration of these results indicated the random effect of `city` was close to zero, so it was removed from the model, as per testing by restricted likelihood ratio test via the `RLRsim` package (for some dependent variables, this is true of the main `interventionT` model, as well).  `lsmeans` computes an 'exact' Tukey adjustment based on a multivariate *t*-distribution via a Monte Carlo method for our contrasts of marginal means from the time point * city model.
+
+```{r cache = TRUE}
+filtered$disPrepSize <- 7 # 7 binary questions summed to make this scale
+#disPrep <- glmmTMB(disPrepBehaviorsT/disPrepSize ~ timePoint * gender + interventionT * gender + (1|city/ID), data=filtered, family=binomial, weights=disPrepSize) 
+disPrep <- glmer(cbind(disPrepBehaviorsT, disPrepSize-disPrepBehaviorsT) ~ timePoint * gender + interventionT * gender + (1|city/ID), data=filtered, family=binomial) 
+disPrepLinear <- lmer(disPrepBehaviorsT ~ timePoint * gender + interventionT * gender + (1|city/ID), data=filtered) 
+
+# here because we use a binomial family model, we cannot use RLRsim to test the random effects; however, the size given by ranef(disPrep) is fairly large so we will keep the city random effect in the model; doesn't change primary results much either way
+summary(disPrep)
+Anova(disPrep, type="III")
+#confint(disPrepModel) #gets us the confidence intervals
+
+disPrepCity <- glmer(cbind(disPrepBehaviorsT, disPrepSize-disPrepBehaviorsT) ~ timePoint * city + (1|ID), data=filtered, family=binomial)
+Anova(disPrepCity, type="III")
+disPrepCityMM <- lsmeans::lsmeans(disPrepCity, ~ timePoint * city)
+summary(rbind(pairs(disPrepCityMM, by="city")[c(1,3,4,6)], pairs(disPrepCityMM, by="timePoint")))
+
+```
+
+
+## Use plotting function to generate plots
+Have to pre-determine y-axis limits to equate them between panels.  Pass marginal means of intervention effect to function.
+
+```{r cache = TRUE}
+#mmeans <- lsmeans::lsmeans(disPrep, ~interventionT)  #marginal means
+mmeans <- lsmeans::lsmeans(disPrepLinear, ~interventionT)
+summary(mmeans)
+limits <- c(4,6.5)
+theme <- theme_minimal()
+rnge <- range(filtered$disPrepBehaviorsT, na.rm = TRUE)
+caption = "Seven-item yes/no scale (range %d - %d), with greater values indicating greater engagement in disaster preparation behaviors. Shaded region depicts size of difference between pre- and post-intervention marginal means."
+#plot_line_bar("disPrepBehaviorsT", limits, mmeans, theme, "Disaster Preparation Behaviors", logit=7, rnge = rnge, caption = caption, save = TRUE)
+plot_line_bar("disPrepBehaviorsT", limits, mmeans, theme, "Disaster Preparation Behaviors", logit=FALSE, rnge = rnge, caption = caption, save = TRUE)
+```
+
+Another plot of the same data, passing a different ggtheme.
+
+```{r cache = TRUE}
+theme <- theme_grey()
+plot_line_bar("disPrepBehaviorsT", limits, mmeans, theme, "Disaster Preparation Behaviors", logit=7, caption = caption, rnge = rnge, save = FALSE)
+```
+
+We continue this style of analysis for the other dependent measures of interest: PTSD, PHQ, help-seeking (mental health related), help-seeking (disaster related), and social cohesion.
+
+```{r cache = TRUE}
+mA <- lmer(phqMean6_T ~ timePoint * gender + interventionT * gender + (1|city/ID), data=filtered) 
+m0 <- lmer(phqMean6_T ~ timePoint * gender + interventionT * gender + (1|ID), data=filtered)
+m <- lmer(phqMean6_T ~ timePoint * gender + interventionT * gender + (1|city), data=filtered)
+exactRLRT(m=m, mA=mA, m0=m0)
+# results tell us city random effect is not needed, save m0 model
+phq <- m0
+
+summary(phq)
+Anova(phq, type="III")
+mmeans <- lsmeans::lsmeans(phq, ~interventionT)  #marginal means
+summary(mmeans)
+limits <- c(1.2,1.9)
+theme <- theme_minimal()
+#rnge <- range(filtered$phqMean6_T, na.rm = TRUE)'
+rnge <- c(0,3)
+caption = "Mean of nine-item Patient Health Questionnaire (PHQ, items each range %d - %d), with greater values indicating greater depressive symptoms. Shaded region depicts size of difference between pre- and post-intervention marginal means."
+plot_line_bar("phqMean6_T", limits, mmeans, theme, "Mean PHQ", position=c(.8825, .70), by = .2, caption = caption, rnge = rnge, save = FALSE)
+
+phqCity <- lmer(phqMean6_T ~ timePoint * city + (1|ID), data=filtered) 
+Anova(phqCity, type="III")
+phqCityMM <- lsmeans::lsmeans(phqCity, ~ timePoint * city)
+summary(rbind(pairs(phqCityMM, by="city")[c(1,3,4,6)], pairs(phqCityMM, by="timePoint")))
+```
+
+```{r cache = TRUE}
+mA <- lmer(ptsdMean11_T ~ timePoint * gender + interventionT * gender + (1|city/ID), data=filtered) 
+m0 <- lmer(ptsdMean11_T ~ timePoint * gender + interventionT * gender + (1|ID), data=filtered)
+m <- lmer(ptsdMean11_T ~ timePoint * gender + interventionT * gender + (1|city), data=filtered)
+exactRLRT(m=m, mA=mA, m0=m0)
+#results tell us city random effect not needed, keep m0
+ptsd <- m0
+
+summary(ptsd)
+Anova(ptsd, type="III")
+mmeans <- lsmeans::lsmeans(ptsd, ~interventionT)  #marginal means
+summary(mmeans)
+limits <- c(1.4, 2.1)
+theme <- theme_minimal()
+#rnge <- range(filtered$ptsdMean11_T, na.rm = TRUE)
+rnge = c(1,5) 
+caption = "Mean of 17-item scale (items each range %d - %d), with greater values indicating greater expression of PTSD symptoms. Shaded region depicts size of difference between pre- and post-intervention marginal means."
+plot_line_bar("ptsdMean11_T", limits, mmeans, theme, "Mean PTSD", position=c(.8825, .805), by=.2, caption = caption, rnge = rnge, save = FALSE)
+
+ptsdCity <- lmer(ptsdMean11_T ~ timePoint * city + (1|ID), data=filtered) 
+Anova(ptsdCity, type="III")
+ptsdCityMM <- lsmeans::lsmeans(ptsdCity, ~ timePoint * city)
+summary(rbind(pairs(ptsdCityMM, by="city")[c(1,3,4,6)], pairs(ptsdCityMM, by="timePoint")))
+
+```
+
+```{r cache = TRUE}
+#mA <- lmer(HelpSeekingMentalT ~ timePoint * gender + interventionT * gender + (1|city/ID), data=filtered) 
+#m0 <- lmer(HelpSeekingMentalT ~ timePoint * gender + interventionT * gender + (1|ID), data=filtered)
+#m <- lmer(HelpSeekingMentalT ~ timePoint * gender + interventionT * gender + (1|city), data=filtered)
+#exactRLRT(m=m, mA=mA, m0=m0)
+# results tell us city random effect not needed, keep m0
+help_mental <- clmm(HelpSeekingMentalT ~ timePoint * gender + interventionT * gender + (1|ID), data=filtered)
+help_mental_linear <- lmer(as.numeric(HelpSeekingMentalT) ~ timePoint * gender + interventionT * gender + (1|ID), data= filtered)
+summary(help_mental)
+Anova(help_mental, type="III")
+mmeans <- lsmeans::lsmeans(help_mental_linear, ~interventionT)  #marginal means
+summary(mmeans)
+limits <- c(2, 2.7)
+theme <- theme_minimal()
+rnge <- range(as.numeric(filtered$HelpSeekingMentalT), na.rm = TRUE)
+caption = "Greater values indicate greater willingness to seek help from others for mental health concerns (single item, range %d - %d). Shaded region depicts size of difference between pre- and post-intervention marginal means."
+plot_line_bar("HelpSeekingMentalT", limits, mmeans, theme, "Help seeking - mental health related", position=c(.15,.70) , by=.2, caption = caption, rnge = rnge, save = FALSE)
+
+help_mentalCity <- clmm(HelpSeekingMentalT ~ timePoint * city + (1|ID), data=filtered) 
+Anova(help_mentalCity, type="III")
+help_mentalCityMM <- lsmeans::lsmeans(help_mentalCity, ~ timePoint * city)
+summary(rbind(pairs(help_mentalCityMM, by="city")[c(1,3,4,6)], pairs(help_mentalCityMM, by="timePoint")))
+
+```
+
+
+
+```{r cache = TRUE}
+#mA <- clmm(HelpSeekingDisT ~ timePoint * gender + interventionT * gender + (1|city/ID), data=filtered) 
+m0 <- clmm(HelpSeekingDisT ~ timePoint * gender + interventionT * gender + (1|ID), data=filtered)
+#m <- clmm(HelpSeekingDisT ~ timePoint * gender + interventionT * gender + (1|city), data=filtered)
+#exactRLRT(m=m, mA=mA, m0=m0)
+# tells us the city random effect is indeed needed; we'll take mA
+help_dist <- m0
+help_dist_linear <- lmer(as.numeric(HelpSeekingDisT) ~ timePoint * gender + interventionT * gender + (1|ID), data = filtered)
+summary(help_dist)
+Anova(help_dist, type="III")
+mmeans <- lsmeans::lsmeans(help_dist_linear, ~interventionT)  #marginal means
+summary(mmeans)
+limits <- c(2.2, 3)
+theme <- theme_minimal()
+rnge <- range(as.numeric(filtered$HelpSeekingDisT), na.rm = TRUE)
+caption = "Greater values indicate greater willingness to seek help from to prepare for or after a disaster (single item, range %d - %d). Shaded region depicts size of difference between pre- and post-intervention marginal means."
+plot_line_bar("HelpSeekingDisT", limits, mmeans, theme, "Help seeking - disaster related", position=c(.15,.70), by=.2, caption = caption, rnge = rnge, save = FALSE)
+
+help_distCity <- clmm(HelpSeekingDisT ~ timePoint * city + (1|ID), data=filtered)
+Anova(help_distCity, type="III")
+help_distCityMM <- lsmeans::lsmeans(help_distCity, ~ timePoint * city)
+summary(rbind(pairs(help_distCityMM, by="city")[c(1,3,4,6)], pairs(help_distCityMM, by="timePoint")))
+
+```
+
+```{r cache = TRUE}
+mA <- lmer(socialCohesionT ~ timePoint * gender + interventionT * gender + (1|city/ID), data=filtered) 
+m0 <- lmer(socialCohesionT ~ timePoint * gender + interventionT * gender + (1|ID), data=filtered)
+m <- lmer(socialCohesionT ~ timePoint * gender + interventionT * gender + (1|city), data=filtered)
+exactRLRT(m=m, mA=mA, m0=m0)
+# tells us the city random effect is indeed needed; we'll take mA
+soc_coh <- mA
+
+summary(soc_coh)
+Anova(help_dist, type="III")
+mmeans <- lsmeans::lsmeans(soc_coh, ~interventionT)  #marginal means
+summary(mmeans)
+limits <- c(6.5,8.25)
+theme <- theme_minimal()
+rnge <- range(filtered$socialCohesionT, na.rm = TRUE)
+caption = "Two-item scale (range %d - %d) with greater values indicating greater social cohesion.  Shaded region depicts size of difference between pre- and post-intervention marginal means."
+plot_line_bar("socialCohesionT", limits, mmeans, theme, "Social Cohesion", position=c(.15,.68), caption = caption, rnge = rnge, save = FALSE)
+
+soc_cohCity <- lmer(socialCohesionT ~ timePoint * city + (1|ID), data=filtered)
+Anova(soc_cohCity, type="III")
+soc_cohCityMM <- lsmeans::lsmeans(soc_cohCity, ~ timePoint * city)
+summary(rbind(pairs(soc_cohCityMM, by="city")[c(1,3,4,6)], pairs(soc_cohCityMM, by="timePoint")))
+
+```
+
+We'll do our other models without plotting the results.  First let's look at their distributions.
+
+```{r cache = TRUE}
+dvs = c('disMH_T', 'disAttribNaturalT', 'disAttribGodT', 'disAttribKarmaT', 'HelpGivingDisT', 'HelpGivingMentalT', 'disPrepSelfPerceptT', 'copingPuja_T', 'copingCalming_T','copingSubuse_T', 'distressT', 'chronicStressorsT')
+var=dvs[1]
+for(var in dvs) {
+  print(ggplot(data = filtered, aes_string(x=var)) + geom_histogram(bins=14))
+}
+```
+
+Disaster-related mental health concerns seeems relatively normally-distributed; disaster attribution variables are not well distributed and might be best approximated by cumulative logit / probit models; help giving - disaster related and help giving - mental health related appear to have near-zero variance and will not be analyzed; disaster-related self perception is not very normally distributed but a linear model may suffice; chronic stressors & coping variables are not well distributed and might be best approximated by cumulative logit / probit models, with substance abuse coping not displaying much variance; distress is a logistic process.
+
+```{r cache = TRUE}
+#factor_dvs <- c('disAttribNaturalT', 'disAttribGodT', 'disAttribKarmaT','disPrepSelfPerceptT', 'copingPuja_T', 'copingCalming_T','copingSubuse_T', 'chronicStressorsT')
+factor_dvs <- c('disAttribNaturalT', 'disAttribGodT', 'disAttribKarmaT', 'copingPuja_T', 'copingCalming_T','copingSubuse_T', 'chronicStressorsT')
+filtered %<>% mutate_at(factor_dvs, funs(factor(.)))
+
+mA <- lmer(disMH_T ~ timePoint * gender + interventionT * gender + (1|city/ID), data=filtered) 
+m0 <- lmer(disMH_T ~ timePoint * gender + interventionT * gender + (1|ID), data=filtered)
+m <- lmer(disMH_T ~ timePoint * gender + interventionT * gender + (1|city), data=filtered)
+exactRLRT(m=m, mA=mA, m0=m0)
+# tells us the city random effect is not needed; we'll take m0
+disMH <- m0
+summary(disMH)
+Anova(disMH, type="III")
+
+#mA <- clmm(disAttribNaturalT  ~ timePoint * gender + interventionT * gender + (1|city/ID), data=filtered) 
+m0 <- clmm(disAttribNaturalT  ~ timePoint * gender + interventionT * gender + (1|ID), data=filtered)
+#m <- clmm(disAttribNaturalT  ~ timePoint * gender + interventionT * gender + (1|city), data=filtered)
+#exactRLRT(m=m, mA=mA, m0=m0)
+# tells us the city random effect is not needed; we'll take m0
+disAttribNatural <- m0
+summary(disAttribNatural)
+Anova(disAttribNatural, type="III")
+
+#mA <- clmm(disAttribGodT ~ timePoint * gender + interventionT * gender + (1|city/ID), data=filtered) 
+m0 <- clmm(disAttribGodT ~ timePoint * gender + interventionT * gender + (1|ID), data=filtered)
+#m <- clmm(disAttribGodT ~ timePoint * gender + interventionT * gender + (1|city), data=filtered)
+#exactRLRT(m=m, mA=mA, m0=m0)
+# tells us the city random effect is needed; we'll take mA
+disAttribGod <- m0 # as m0 because clmm wont run with nested random effects here
+summary(disAttribGod)
+Anova(disAttribGod, type="III")
+
+#mA <- clmm(disAttribKarmaT  ~ timePoint * gender + interventionT * gender + (1|city/ID), data=filtered) 
+m0 <- clmm(disAttribKarmaT  ~ timePoint * gender + interventionT * gender + (1|ID), data=filtered)
+#m <- clmm(disAttribKarmaT  ~ timePoint * gender + interventionT * gender + (1|city), data=filtered)
+#exactRLRT(m=m, mA=mA, m0=m0)
+# tells us the city random effect is not needed; we'll take m0
+disAttribKarma  <- m0
+summary(disAttribKarma )
+Anova(disAttribKarma , type="III")
+
+#linear dis prep self perception
+#mA <- clmm(disPrepSelfPerceptT  ~ timePoint * gender + interventionT * gender + (1|city/ID), data=filtered) 
+#m0 <- clmm(disPrepSelfPerceptT ~ timePoint * gender + interventionT * gender + (1|ID), data=filtered)
+m0 <- lmer(disPrepSelfPerceptT ~ timePoint * gender + interventionT * gender + (1|ID), data=filtered)
+#m <- clmm(disPrepSelfPerceptT ~ timePoint * gender + interventionT * gender + (1|city), data=filtered)
+#exactRLRT(m=m, mA=mA, m0=m0)
+# tells us the city random effect is not needed; we'll take m0
+disPrep_selfPercept <- m0
+summary(disPrep_selfPercept) 
+Anova(disPrep_selfPercept, type="III")
+
+#mA <- clmm(copingPuja_T ~ timePoint * gender + interventionT * gender + (1|city/ID), data=filtered) 
+m0 <- clmm(copingPuja_T ~ timePoint * gender + interventionT * gender + (1|ID), data=filtered)
+#m <- clmm(copingPuja_T ~ timePoint * gender + interventionT * gender + (1|city), data=filtered)
+#exactRLRT(m=m, mA=mA, m0=m0)
+# tells us the city random effect is needed; we'll take mA 
+copingPuja <- m0
+summary(copingPuja)
+Anova(copingPuja, type="III")
+
+#mA <- clmm(copingCalming_T ~ timePoint * gender + interventionT * gender + (1|city/ID), data=filtered) 
+m0 <- clmm(copingCalming_T ~ timePoint * gender + interventionT * gender + (1|ID), data=filtered)
+#m <- clmm(copingCalming_T  ~ timePoint * gender + interventionT * gender + (1|city), data=filtered)
+#exactRLRT(m=m, mA=mA, m0=m0)
+# tells us the city random effect is not needed; we'll take m0
+copingCalming <- m0
+summary(copingCalming)
+Anova(copingCalming, type="III")
+
+#mA <- clmm(copingSubuse_T  ~ timePoint * gender + interventionT * gender + (1|city/ID), data=filtered) 
+m0 <- clmm(copingSubuse_T  ~ timePoint * gender + interventionT * gender + (1|ID), data=filtered)
+#m <- clmm(copingSubuse_T   ~ timePoint * gender + interventionT * gender + (1|city), data=filtered)
+#exactRLRT(m=m, mA=mA, m0=m0)
+# tells us the city random effect is not needed; we'll take m0
+copingSubuse <- m0
+summary(copingSubuse) 
+Anova(copingSubuse, type="III")
+
+#mA <- clmm(chronicStressorsT ~ timePoint * gender + interventionT * gender + (1|city/ID), data=filtered) 
+m0 <- clmm(chronicStressorsT ~ timePoint * gender + interventionT * gender + (1|ID), data=filtered)
+#m <- clmm(chronicStressorsT ~ timePoint * gender + interventionT * gender + (1|city), data=filtered)
+#exactRLRT(m=m, mA=mA, m0=m0)
+# tells us the city random effect is not needed; we'll take m0
+chronicStressors <- m0
+summary(chronicStressors)
+Anova(chronicStressors, type="III")
+
+distress <- glmer(distressT ~ timePoint * gender + interventionT * gender + (1|ID), data=filtered, family = binomial)
+summary(distress)
+Anova(distress, type="III")
+```
+
+
+## Summary plots
+
+Here we'll make a plot of unstandardized regression coefficients for the intervention effects derived from our above mixed models.
+
+```{r}
+dv_names <- 
+c('Disaster preparation behaviors', 'Mean PHQ', 'Mean PTSD', 'Social cohesion', 'Help seeking - mental health related', 'Help seeking - disaster related', 'Disaster-related mental health concerns', 'Disaster attribution - natural', 'Disaster attribution - God', 'Disaster attribution - karma', 'Disaster preparation self-perception', 'Coping - puja', 'Coping - calming', 'Coping - substance use') #'Distress - other',
+estimates <- c()
+estimates[1] <- summary(disPrep)$coef[,'Estimate'][4]
+estimates[1] <- exp(estimates[1]) / (1 + exp(estimates[1]))
+estimates[2] <- summary(phq)$coef[,'Estimate'][4]
+estimates[3] <- summary(ptsd)$coef[,'Estimate'][4]
+estimates[4] <- summary(soc_coh)$coef[,'Estimate'][4]
+estimates[5] <- summary(help_mental)$coef[,'Estimate'][4]
+estimates[6] <- summary(help_dist)$coef[,'Estimate'][4]
+estimates[7] <- summary(disMH)$coef[,'Estimate'][4]
+estimates[8] <- summary(disAttribNatural)$coef[,'Estimate'][4]
+estimates[9] <- summary(disAttribGod)$coef[,'Estimate'][4]
+estimates[10] <- summary(disAttribKarma)$coef[,'Estimate'][4]
+estimates[11] <- summary(disPrep_selfPercept)$coef[,'Estimate'][4]
+estimates[12] <- summary(copingPuja)$coef[,'Estimate'][4]
+estimates[13] <- summary(copingCalming)$coef[,'Estimate'][4]
+estimates[14] <- summary(copingSubuse)$coef[,'Estimate'][4]
+#estimates[15] <- summary(distress)$coef[,'Estimate'][4]
+#estimates[15] <- exp(estimates[15]) / (1 + exp(estimates[15]))
+
+sds <- c()
+sds[1] <- sd(filtered$disPrepBehaviorsT, na.rm = TRUE)
+sds[2] <- sd(filtered$phqMean6_T, na.rm = TRUE)
+sds[3] <- sd(filtered$ptsdMean11_T, na.rm = TRUE)
+sds[4] <- sd(filtered$socialCohesionT, na.rm = TRUE)
+sds[5] <- sd(filtered$HelpSeekingMentalT, na.rm = TRUE)
+sds[6] <- sd(filtered$HelpSeekingDisT, na.rm = TRUE)
+sds[7] <- sd(filtered$disMH_T, na.rm = TRUE)
+sds[8] <- sd(filtered$disAttribNaturalT, na.rm = TRUE) 
+sds[9] <- sd(filtered$disAttribGodT, na.rm = TRUE) 
+sds[10] <- sd(filtered$disAttribKarmaT, na.rm = TRUE) 
+sds[11] <- sd(filtered$disPrepSelfPerceptT, na.rm = TRUE) 
+sds[12] <- sd(filtered$copingPuja_T, na.rm = TRUE) 
+sds[13] <- sd(filtered$copingCalming_T, na.rm = TRUE) 
+sds[14] <- sd(filtered$copingSubuse_T, na.rm = TRUE) 
+#sds[15] <- sd(filtered$distressT, na.rm = TRUE) 
+
+effects <- data.frame(dvs = dv_names, estimates = estimates, sds = sds, stdestimates = estimates/sds)
+
+ggplot(effects[1:4,], aes(x=reorder(dvs,estimates), y=estimates)) + 
+  geom_point(stat='identity', fill="black", size=3)  +
+  geom_segment(aes(y = 0, 
+                   x = dvs, 
+                   yend = estimates, 
+                   xend = dvs), 
+               color = "black") +
+  labs(title="Intervention effect regression coefficients", y="", x="") + 
+  ylim(-.5, 1) +
+  geom_hline(yintercept=0, color="grey") + 
+  coord_flip() + 
+  theme_minimal() + 
+  theme(aspect.ratio = .3)
+
+```
+
+Let's also make a plot of the standarized coefficients (to aid comparison between coefficients derived from dependent variables that are on different scales) by dividing them by the standard deviations of the dependent variables.  They're interpreted as a '1 unit increase in intervention effect (i.e., moving from the pre-intervention phase to the post-intervention phase) is associated with an X standard deviation unit change in the dependent measure, over and above all other effects (e.g., time point, subject-specific intercepts, city effects where applicable).
+
+```{r}
+ggplot(effects, aes(x=reorder(dvs, stdestimates), y=stdestimates)) + 
+  geom_point(stat = "identity", fill = "black", size = 3) + 
+  geom_segment(aes(y = 0,
+                   x = dvs,
+                   yend = stdestimates,
+                   xend = dvs),
+               color = "black") + 
+  labs(title = "Intervention effect standarized regression coefficients", y="", x="") + 
+ 
+  scale_y_continuous(breaks = seq(-.5, .6, by = .25), expand=expand_scale(add = c(.1, .1))) +
+  geom_hline(yintercept = 0, color = "grey") +
+  coord_flip() + 
+  theme_minimal() + 
+  theme(aspect.ratio = .3)
+  ggsave('std reg coef all.pdf', device=cairo_pdf, width = 7, height = .3*7)
+```
+
+## Tabular results
+
+Let's also create a table of the results of our models.  
+
+```{r, results = 'asis'}
+dv_names <- 
+c('Disaster preparation behaviors', 'Mean PHQ', 'Mean PTSD', 'Social cohesion', 'Help seeking - mental health', 'Help seeking - disaster related', 'Disaster-related mental health', 'Disaster attribution - natural', 'Disaster attribution - God', 'Disaster attribution - karma', 'Disaster preparation self-perception', 'Coping - puja', 'Coping - calming', 'Coping - substance use') #'Distress - other',
+
+#models <- list(disPrep, phq, ptsd, soc_coh, help_mental, help_dist, disMH, disAttribNatural, disAttribGod, disAttribKarma, disPrep_selfPercept, copingPuja, copingCalming, copingSubuse)
+models <- list(disPrepLinear, phq, ptsd, soc_coh, help_mental, help_dist, disMH, disAttribNatural, disAttribGod, disAttribKarma, disPrep_selfPercept, copingPuja, copingCalming, copingSubuse)
+
+texreg(models, type = "html",  digits = 3, bold = .05, booktabs = TRUE, sideways = TRUE, use.packages = FALSE, single.row = FALSE, custom.model.names = dv_names, leading.zero = TRUE, stars = c(0.05, 0.01, 0.001), custom.note = "* $p < 0.05$, ** $p < 0.01$, *** $p < 0.001$. Coefficients with $p < 0.05$ in \\textbf{bold}.  Results are presented as coefficient (standard error).",  include.aic = FALSE, include.bic = FALSE, include.dic = FALSE, include.loglik = FALSE, include.nobs = FALSE, include.groups = FALSE, include.variance = TRUE, custom.coef.map = list('(Intercept)' = '(Constant)', 'timePoint2' = 'Time = 2', 'timePoint3' = 'Time = 3', 'genderMale' = 'Gender (male)', 'interventionTIntervention' = 'Intervention', 'timePoint2:genderMale' = 'Gender (male) x Time = 2', 'timePoint3:genderMale' = 'Gender (male) x Time = 3', 'genderMale:interventionTIntervention' = 'Gender (male) x Intervention'))
+```
+
+
+
+\begin{sidewaystable}
+\begin{center}
+\begin{tabular}{l c c c c }
+\toprule
+ & Disaster preparation & & & \\
+ & behaviors & Mean PHQ & Mean PTSD & Social cohesion \\
+\midrule
+(Constant)               & $\mathbf{0.621}^{**}$  & $\mathbf{0.774}^{***}$  & $\mathbf{1.965}^{***}$  & $\mathbf{6.816}^{***}$ \\
+                         & $(0.210)$              & $(0.034)$               & $(0.046)$               & $(0.310)$              \\
+Time point = 2           & $\mathbf{0.363}^{***}$ & $\mathbf{-0.139}^{**}$  & $\mathbf{-0.125}^{*}$   & $0.107$                \\
+                         & $(0.109)$              & $(0.043)$               & $(0.050)$               & $(0.216)$              \\
+Time point = 3           & $\mathbf{0.720}^{***}$ & $\mathbf{-0.135}^{*}$   & $-0.079$                & $-0.052$               \\
+                         & $(0.196)$              & $(0.065)$               & $(0.076)$               & $(0.328)$              \\
+Intervention             & $\mathbf{0.655}^{***}$ & $\mathbf{-0.258}^{***}$ & $\mathbf{-0.274}^{***}$ & $\mathbf{0.802}^{**}$  \\
+                         & $(0.167)$              & $(0.055)$               & $(0.065)$               & $(0.283)$              \\
+\midrule
+Var: City (Intercept)    & 0.077                  &                         &                         & 0.154                  \\
+Var: Subject (Intercept)      & 0.399                  & 0.116                   & 0.270                   & 1.036                       \\
+Var: Residual            &                        & 0.116                   & 0.152                   & 2.757                  \\
+\bottomrule
+\multicolumn{5}{l}{\scriptsize{* $p < 0.05$, ** $p < 0.01$, *** $p < 0.001$. Coefficients with $p < 0.05$ in \textbf{bold}.  Results are presented as coefficient (standard error).}}
+\end{tabular}
+\label{table:coefficients}
+\end{center}
+\end{sidewaystable}
+
+
+
+\begin{sidewaystable}
+\begin{center}
+\scalebox{0.55}{
+\begin{tabular}{l c c c c c c c c c c c c c c c }
+\toprule
+ & Disaster preparation & & & Help seeking & Help seeking & Social & Disaster-related & Disaster attribution: & Disaster attribution: & Disaster attribution: & Disaster preparation & Coping: & Coping: & Coping: & \\
+ & behaviors & Mean PHQ & Mean PTSD & mental health & disaster-related & cohesion & mental health & natural &  God & karma & self-perception & puja & calming & substance use & Chronic stressors \\
+\midrule
+(Constant)               & $\mathbf{0.621}^{**}$  & $\mathbf{0.774}^{***}$  & $\mathbf{1.965}^{***}$  & $\mathbf{2.185}^{***}$ & $\mathbf{2.429}^{***}$ & $\mathbf{6.816}^{***}$ & $\mathbf{4.855}^{***}$ & $\mathbf{3.220}^{***}$ & $\mathbf{2.028}^{***}$ & $\mathbf{1.438}^{***}$ & $\mathbf{5.956}^{***}$ & $\mathbf{1.729}^{***}$ & $\mathbf{1.620}^{***}$ & $\mathbf{1.262}^{***}$ & $\mathbf{0.746}^{***}$ \\
+                         & $(0.210)$              & $(0.034)$               & $(0.046)$               & $(0.068)$              & $(0.118)$              & $(0.310)$              & $(0.115)$              & $(0.069)$              & $(0.243)$              & $(0.061)$              & $(0.082)$              & $(0.133)$              & $(0.058)$              & $(0.037)$              & $(0.059)$              \\
+Time point = 2           & $\mathbf{0.363}^{***}$ & $\mathbf{-0.139}^{**}$  & $\mathbf{-0.125}^{*}$   & $-0.039$               & $-0.063$               & $0.107$                & $-0.033$               & $-0.158$               & $-0.133$               & $0.143$                & $0.206$                & $-0.067$               & $0.045$                & $-0.084$               & $-0.147$               \\
+                         & $(0.109)$              & $(0.043)$               & $(0.050)$               & $(0.102)$              & $(0.099)$              & $(0.216)$              & $(0.172)$              & $(0.101)$              & $(0.104)$              & $(0.090)$              & $(0.128)$              & $(0.082)$              & $(0.086)$              & $(0.052)$              & $(0.077)$              \\
+Time point = 3           & $\mathbf{0.720}^{***}$ & $\mathbf{-0.135}^{*}$   & $-0.079$                & $-0.127$               & $-0.136$               & $-0.052$               & $-0.160$               & $-0.121$               & $-0.104$               & $\mathbf{0.326}^{*}$   & $\mathbf{0.449}^{*}$   & $-0.129$               & $0.045$                & $-0.081$               & $-0.222$               \\
+                         & $(0.196)$              & $(0.065)$               & $(0.076)$               & $(0.150)$              & $(0.150)$              & $(0.328)$              & $(0.254)$              & $(0.149)$              & $(0.159)$              & $(0.133)$              & $(0.187)$              & $(0.125)$              & $(0.127)$              & $(0.077)$              & $(0.115)$              \\
+Intervention             & $\mathbf{0.655}^{***}$ & $\mathbf{-0.258}^{***}$ & $\mathbf{-0.274}^{***}$ & $\mathbf{0.332}^{**}$  & $\mathbf{0.367}^{**}$  & $\mathbf{0.802}^{**}$  & $-0.336$               & $\mathbf{0.363}^{**}$  & $-0.261$               & $\mathbf{-0.311}^{**}$ & $0.260$                & $0.041$                & $\mathbf{0.425}^{***}$ & $0.009$                & $-0.032$               \\
+                         & $(0.167)$              & $(0.055)$               & $(0.065)$               & $(0.127)$              & $(0.130)$              & $(0.283)$              & $(0.214)$              & $(0.126)$              & $(0.137)$              & $(0.113)$              & $(0.157)$              & $(0.108)$              & $(0.107)$              & $(0.065)$              & $(0.098)$              \\
+\midrule
+Var: City (Intercept)    & 0.077                  &                         &                         &                        & 0.019                  & 0.154                  &                        &                        & 0.105                  &                        &                        & 0.027                  &                        &                        &                        \\
+Var: Subject (Intercept)      & 0.399                   & 0.116                   & 0.270                   & 0.275                  &  0.286                &  1.036                 & 0.800                  & 0.312                  & .673                 & 0.226                  & 0.316                  & 0.466                  & 0.202                  & 0.113                  & 0.335                  \\
+Var: Residual            &                        & 0.116                   & 0.152                   & 0.655                  & 0.584                  & 2.757                  & 1.875                  & 0.641                  & 0.635                  & 0.513                  & 1.045                  & 0.394                  & 0.464                  & 0.167                  & 0.362                  \\
+\bottomrule
+\multicolumn{16}{l}{\scriptsize{* $p < 0.05$, ** $p < 0.01$, *** $p < 0.001$. Coefficients with $p < 0.05$ in \textbf{bold}.  Results are presented as coefficient (standard error).}}
+\end{tabular}
+}
+\label{table:coefficients}
+\end{center}
+\end{sidewaystable}
+
+```{r, cache = TRUE}
+
+anovas <- lapply(models, function(x) Anova(x, type = "III"))
+anovas_df <- lapply(anovas, function(x) as.numeric(c(tail(x,1),x['gender',])))
+anovas_df <- data.frame(t(sapply(anovas_df, `[`)), row.names = dv_names)
+names(anovas_df) <- c('interv.gender.chisq', 'interv.gender.df', 'interv.gender.p', 'gender.chisq', 'gender.df','gender.p')
+anovas_df %<>% select(-gender.df)
+
+mmeans_df <- lapply(models, function(x) as.numeric(summary(pairs(lsmeans::lsmeans(x, ~ gender, at=list(timePoint = "1"))), type = "response"))[-1])
+mmeans_df <-  data.frame(t(sapply(mmeans_df, `[`)), row.names = dv_names)
+names(mmeans_df) <- c('Female-Male', 'se', 'df', 't.stat','p.val')
+
+coefs_int <- sapply(models, function(x) coef(summary(x))['interventionTIntervention',1])
+se_int <- sapply(models, function(x) coef(summary(x))['interventionTIntervention',2])
+p_int <- sapply(models, function(x) coef(summary(x))['interventionTIntervention', ncol(coef(summary(x)))])
+d_int <- vector(mode="numeric", length=length(coefs_int))
+for(i in 1:length(coefs_int)){
+  if(class(models[[i]]) == "merModLmerTest") {
+    y <- getME(models[[i]], name = 'y')
+    X <- getME(models[[i]], name = 'X')
+    d_int[i] <- coefs_int[i] / sd(y[X[,'timePoint2'] == 0 & X[,'timePoint3'] == 0])
+  }
+  else {
+    d_int[i] <- NA
+  }
+}
+coef_int_df <- data.frame(row.names = dv_names, Coefficient = coefs_int, 'Std error' = se_int, 'P value' = p_int, 'Cohens d' = d_int)
+
+coefs_int_gender <- sapply(models, function(x) coef(summary(x))['genderMale:interventionTIntervention',1])
+se_int_gender <- sapply(models, function(x) coef(summary(x))['genderMale:interventionTIntervention',2])
+p_int_gender <- sapply(models, function(x) coef(summary(x))['genderMale:interventionTIntervention', ncol(coef(summary(x)))])
+d_int_gender <- vector(mode="numeric", length=length(coefs_int_gender))
+for(i in 1:length(coefs_int_gender)){
+  if(class(models[[i]]) == "merModLmerTest") {
+    y <- getME(models[[i]], name = 'y')
+    X <- getME(models[[i]], name = 'X')
+    d_int_gender[i] <- coefs_int_gender[i] / sd(y[X[,'timePoint2'] == 0 & X[,'timePoint3'] == 0])
+  }
+  else {
+    d_int_gender[i] <- NA
+  }
+}
+coef_int_gender_df <- data.frame(row.names = dv_names, Coefficient = coefs_int_gender, 'Std error' = se_int_gender, 'P value' = p_int_gender, 'Cohens d' = d_int_gender)
+
+```
+
+```{r, results = "asis"}
+print(xtable(coef_int_df, auto = TRUE, caption = "Intervention effect coefficients", digits = c(2,2,2,4, 2)), type = "latex")
+print(xtable(coef_int_gender_df, auto = TRUE, caption = "Intervention x gender effect coefficients", digits = c(2,2,2,4, 2)), type = "latex")
+```
+
+
+```{r}
+contrasts_1to2_untrans <- data.frame()
+contrasts_1to3_untrans <- data.frame()
+contrasts_1to2_backtrans <- data.frame()
+contrasts_1to3_backtrans <- data.frame()
+
+for(mod in models) {
+  MM <- lsmeans::lsmeans(update(mod, . ~ timePoint * city + (1|ID)), ~ timePoint * city)
+  contrast_result_untrans <- summary(pairs(MM), adjust = "none")
+  contrast_result_backtrans <- summary(pairs(MM), adjust = "none", type = "response")
+  if(dim(contrasts_1to2_backtrans)[1] == 0) {
+    contrasts_1to2_untrans <- contrast_result_untrans[1,]
+    contrasts_1to3_untrans <- contrast_result_untrans[2,]
+    contrasts_1to2_backtrans <- contrast_result_backtrans[1,]
+    contrasts_1to3_backtrans <- contrast_result_backtrans[2,]
+  }
+  else {
+    contrasts_1to2_untrans <- rbind(contrasts_1to2_untrans, setNames(contrast_result_untrans[1,], names(contrasts_1to2_untrans)))
+    contrasts_1to3_untrans <- rbind(contrasts_1to3_untrans, setNames(contrast_result_untrans[2,], names(contrasts_1to3_untrans)))    
+    contrasts_1to2_backtrans <- rbind(contrasts_1to2_backtrans, setNames(contrast_result_backtrans[1,], names(contrasts_1to2_backtrans)))
+    contrasts_1to3_backtrans <- rbind(contrasts_1to3_backtrans, setNames(contrast_result_backtrans[2,], names(contrasts_1to3_backtrans)))
+  }
+}
+row.names(contrasts_1to2_untrans) <- DV_names
+row.names(contrasts_1to3_untrans) <- DV_names
+row.names(contrasts_1to2_backtrans) <- DV_names
+row.names(contrasts_1to3_backtrans) <- DV_names
+
+```
+
+```{r, results = "asis"}
+print(xtable(contrasts_1to2_untrans, auto = TRUE, caption = "Link-scale within subject contrasts for time 1 to time 2 for intervention group", digits =  c(1,1,2,2,2,2,3)), type = "latex", include.rownames = TRUE)
+print(xtable(contrasts_1to3_untrans, auto = TRUE, caption = "Link-scale Within subject contrasts for time 1 to time 3 for intervention group", digits =  c(1,1,2,2,2,2,3)), type = "latex", include.rownames = TRUE)
+print(xtable(contrasts_1to2_backtrans, auto = TRUE, caption = "Back-transformed response-scale within subject contrasts for time 1 to time 2 for intervention group", digits =  c(1,1,2,2,2,2,3)), type = "latex", include.rownames = TRUE)
+print(xtable(contrasts_1to3_backtrans, auto = TRUE, caption = "Back-transformed response-scale within subject contrasts for time 1 to time 3 for intervention group", digits =  c(1,1,2,2,2,2,3)), type = "latex", include.rownames = TRUE)
+```
+
+```{r, results = "asis"}
+print(xtable(mmeans_df, "Marginal contrasts for females - males at time 1", auto = TRUE, digits = c(2,2,2,0,2,4), type = "latex"))
+print(xtable(anovas_df, "ANOVA results for intervention x gender and gender main effects", auto = TRUE, digits = c(2,2,0,4,2,4), type = "latex"))
+```
+
+
+Finally we'll output some descriptive statistics.  First for the mental health variables
+
+<!-- # ```{r, results = "asis"} -->
+<!-- # vars <- filtered %>% select(phqMean6_T, ptsdMean11_T, DisMH1Anxiousdep_T, DisMH2Avoid_T, timePoint) -->
+<!-- # vars %<>% rename(Time = timePoint) -->
+<!-- # tableContinuous(vars = list(vars$phqMean6_T, vars$ptsdMean11_T, vars$DisMH1Anxiousdep_T, vars$DisMH2Avoid_T), group = vars$Time, stats = c('n', 'min', 'q1', 'median', 'mean', 'q3', 'max'), cap = "Descriptive statistics" , nams = c('PHQ', 'PTSD', 'Dis MH - anxious dep', 'Dis MH - avoid'), prec = 2) -->
+<!-- # ``` -->
+
+% latex table generated in R 3.4.2 by xtable 1.8-2 package
+% Mon Oct 23 14:47:35 2017
+\begingroup\footnotesize
+\begin{longtable}{llrrrrrrr}
+ \textbf{Variable} & \textbf{Time point} & $\mathbf{n}$ & \textbf{Min} & $\mathbf{q_1}$ & $\mathbf{\widetilde{x}}$ & $\mathbf{\bar{x}}$ & $\mathbf{q_3}$ & \textbf{Max} \\ 
+  \hline
+PHQ & 1 & 202 & 1 & 1.33 & 1.67 & 1.77 & 2.11 & 3.44 \\ 
+   & 2 & 201 & 1 & 1.11 & 1.33 & 1.51 & 1.78 & 3.33 \\ 
+   & 3 & 202 & 1 & 1.11 & 1.33 & 1.38 & 1.56 & 3.22 \\ 
+   \hline
+ & all &  & 1 & 1.11 & 1.44 & 1.55 & 1.89 & 3.44 \\ 
+   \hline
+PTSD & 1 & 202 & 1 & 1.41 & 1.88 & 1.96 & 2.35 & 4.53 \\ 
+   & 2 & 201 & 1 & 1.24 & 1.53 & 1.71 & 1.94 & 4.53 \\ 
+   & 3 & 202 & 1 & 1.18 & 1.47 & 1.61 & 1.94 & 3.88 \\ 
+   \hline
+ & all &  & 1 & 1.24 & 1.59 & 1.76 & 2.12 & 4.53 \\ 
+   \hline
+Dis MH - anxious dep & 1 & 202 & 1 & 2.00 & 2.00 & 2.57 & 3.75 & 5.00 \\ 
+   & 2 & 201 & 1 & 2.00 & 2.00 & 2.33 & 3.00 & 5.00 \\ 
+   & 3 & 202 & 1 & 2.00 & 2.00 & 2.18 & 3.00 & 5.00 \\ 
+   \hline
+ & all &  & 1 & 2.00 & 2.00 & 2.36 & 3.00 & 5.00 \\ 
+   \hline
+Dis MH - avoid & 1 & 202 & 1 & 2.00 & 2.00 & 2.27 & 3.00 & 5.00 \\ 
+   & 2 & 201 & 1 & 2.00 & 2.00 & 2.32 & 3.00 & 5.00 \\ 
+   & 3 & 202 & 1 & 1.00 & 2.00 & 2.19 & 3.00 & 5.00 \\ 
+   \hline
+ & all &  & 1 & 2.00 & 2.00 & 2.26 & 3.00 & 5.00 \\ 
+   \hline
+\hline
+\caption{Descriptive statistics} 
+\label{}
+\end{longtable}
+\endgroup
+
+Then also for the qualitative data regarding new trauma experiences.
+```{r, results = "asis"}
+qualitative_data <- filtered %>% filter(timePoint == "3") %>% select(T3NewTrauma, T3NewTraumaopen)
+tableNominal(vars = as.data.frame(qualitative_data), cumsum = FALSE, longtable = TRUE)
+```
+
+
+<!-- # ```{r, results = 'asis'} -->
+<!-- # coefs.phq.all <- c(0.038072, -0.2825386, -0.4258291,-0.2824675, 0.1758012, 0.1408377, 0.3551858, 0.6727174, 0.6818101, -0.0107541,0.01520377) -->
+<!-- # coefs.phq.pre <- c(0.0649263, -0.1592054, '' , -0.2884423, 0.0903862, 0.0719257 , NA , NA , NA, NA, NA) -->
+<!-- # coefs.phq.post <- c(.0257482, NA, .0118511, .541067, .3486374, NA , .2365405, NA, NA, NA, NA) -->
+<!-- #  -->
+<!-- # coefs.phq.all <- round(coefs.phq.all, 3) -->
+<!-- # coefs.phq.pre <- round(coefs.phq.pre, 3,) -->
+<!-- # coefs.phq.post <- round(coefs.phq.post, 3) -->
+<!-- #  -->
+<!-- # #coefs.phq.all <- as.character(round(coefs.phq.all, 3)) -->
+<!-- # #coefs.phq.pre <- as.character(round(coefs.phq.pre, 3)) -->
+<!-- # #coefs.phq.post <- as.character(round(coefs.phq.post, 3)) -->
+<!-- #  -->
+<!-- # #coefs.phq.all[is.na(coefs.phq.all)] <- '' -->
+<!-- # #coefs.phq.pre[is.na(coefs.phq.pre)] <- '' -->
+<!-- # #coefs.phq.post[is.na(coefs.phq.post)] <- '' -->
+<!-- #  -->
+<!-- # coefs.ptsd.all <- c() -->
+<!-- # coefs.ptsd.pre <- c() -->
+<!-- # coefs.ptsd.post <- c() -->
+<!-- #  -->
+<!-- # int.phq.all <- c(-0.0132511,    0.0893951, -0.3539684,   -0.2111087, -0.4971285,   -0.3545297, -0.498916,   -0.0660189, 0.0583227,    0.2932798, -0.0810246,    0.3626999, -0.0284242,    0.7387959, 0.3081396,    1.037295, 0.2369377,    1.126682,  -0.0218604,  -0.0012943,0.002961,    0.047924) -->
+<!-- # int.phq.all <- matrix(int.phq.all, ncol = 2, byrow = TRUE) -->
+<!-- # int.phq.all <- round(int.phq.all, 3) -->
+<!-- # #int.phq.all <- as.character(round(int.phq.all, 3)) -->
+<!-- # #int.phq.all[is.na(int.phq.all)] <- '' -->
+<!-- #  -->
+<!-- # int.phq.pre <- c(-0.0030578,    0.1329103, -0.2700661,   -0.0483447, NA, NA , -0.4996224, -0.0772622, -0.0300887,    0.2108611, -0.1474257,    0.2912771, NA, NA , NA, NA , NA, NA , NA, NA , NA, NA) -->
+<!-- # int.phq.pre <- matrix(int.phq.pre, ncol = 2, byrow = TRUE) -->
+<!-- # int.phq.pre <- round(int.phq.pre, 3) -->
+<!-- # #int.phq.pre <- as.character(round(int.phq.pre, 3)) -->
+<!-- # #int.phq.pre[is.na(int.phq.pre)] <- '' -->
+<!-- #  -->
+<!-- # int.phq.post <- c(-0.0224488 ,   0.0739452, NA, NA  , -0.048616 ,   0.0723183, 0.0343581  ,  1.047776, 0.1481182,    0.5491565, NA, NA , -0.083031 ,    0.556112, NA, NA , NA, NA , NA, NA , NA, NA  ) -->
+<!-- # int.phq.post <- matrix(int.phq.post, ncol = 2, byrow = TRUE) -->
+<!-- # int.phq.post <- round(int.phq.post, 3) -->
+<!-- # #int.phq.post <- as.character(round(int.phq.post, 3)) -->
+<!-- # #int.phq.post[is.na(int.phq.post)] <- '' -->
+<!-- #  -->
+<!-- # int.ptsd.all <- c() -->
+<!-- # int.ptsd.pre <- c() -->
+<!-- # int.ptsd.post <- c() -->
+<!-- #  -->
+<!-- # rows <- c('a: Earthquake-related trauma', 'Time point = 2', 'Time point = 3', 'b: Mean PHQ', 'c\': Earthquake-related trauma', 'Time point = 2', 'Time point = 3', 'Intervention', 'Intervention x Mean PHQ', 'ab: pre-intervention', 'ab: post-intervention') -->
+<!-- # mediation <- data.frame(coefs = , interval = ) -->
+<!-- #  -->
+<!-- # texreg(mediation, groups = list('Outcome: mental health measure' = 1:3, 'Outcome: Disaster prevention behaviors' = 4:9, 'Mediation' = 10:11)) -->
+<!-- # ``` -->
+<!-- #  -->
+<!-- #  -->
+<!-- # ```{r, results = 'asis'}  -->
+<!-- # model.summary <- lapply(models, function(x) coef(summary(x))[4,]) -->
+<!-- # model.stats <- lapply(models, function(x) Anova(x)[2,]) -->
+<!-- # #model.confint <-  -->
+<!-- # stargazer(models) -->
+<!-- # #stargazer(models, type = "html") -->
+<!-- # ``` -->
